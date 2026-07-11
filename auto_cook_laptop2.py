@@ -145,6 +145,18 @@ WINDOW_BG_STD  = 22     # 확인 띠 안의 색 편차 허용치 (게임 배경�
 RETRY_SEC = 60
 MAX_FIX_TRIES = 3
 
+# ----- 텔레그램 알림 (전체 화면 스크린샷 전송) -----
+# 사용법: 텔레그램에서 @BotFather 에게 /newbot 으로 봇을 만들어 토큰을 받고,
+# 만든 봇에게 아무 메시지나 하나 보낸 뒤
+# https://api.telegram.org/bot<토큰>/getUpdates 를 브라우저로 열면
+# "chat":{"id":123456789 ...} 에서 내 chat_id를 확인할 수 있음.
+# 둘 다 채우면 켜지고, 비워두면 텔레그램 기능 전체가 꺼짐. (requests 필요:
+# 없다고 나오면 pip install requests)
+TELEGRAM_TOKEN   = ""        # 예: "123456789:AAH9x..."
+TELEGRAM_CHAT_ID = ""        # 예: "123456789"
+TELEGRAM_EVERY_MIN = 30      # 이 간격(분)마다 정기 스크린샷 전송. 0이면 정기 전송만 끔
+TG_EVENT_COOLDOWN = 300      # 같은 오류가 반복될 때 오류 알림 최소 간격(초) — 알림 폭탄 방지
+
 # ----- 가방(아이템 창) 자동 열기 -----
 # 재료 넣기 전에 가방(아이템) 창이 안 보이면 자동으로 한 번 열어봄.
 # 열 방법을 하나는 설정해야 함: 단축키가 있으면 BAG_KEY, 없으면 BAG_BTN(아이콘 좌표).
@@ -534,6 +546,71 @@ def scan_inventory(sct, templates):
             if best_name is not None and best_diff <= threshold_for(best_name):
                 found.setdefault(best_name, []).append((nx, ny))
     return found, min_diffs
+
+
+# ---------------------------------------------------------------- 텔레그램 알림
+
+_tg_last_event = 0.0     # 마지막 오류 알림 시각 (반복 알림 폭탄 방지용)
+
+
+def tg_enabled():
+    return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def _tg_send_now(caption):
+    """전체 화면(모든 모니터 합침)을 캡처해 텔레그램으로 전송. 이 함수는 느릴 수
+    있으니(전송 1~2초) 반드시 별도 스레드에서 호출할 것 (tg_send가 해줌)."""
+    try:
+        import io
+        import requests
+        with mss.mss() as s:                       # 스레드마다 mss 인스턴스 따로
+            shot = s.grab(s.monitors[0])           # [0] = 모든 모니터 합친 전체 화면
+            img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=70)   # PNG보다 훨씬 작게 (수백 KB)
+        buf.seek(0)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000]},
+            files={"photo": ("screen.jpg", buf, "image/jpeg")},
+            timeout=20,
+        )
+        if r.status_code == 200:
+            print(f"  [텔레그램] 전송됨: {caption}")
+        else:
+            print(f"  [텔레그램] 전송 실패 (응답 {r.status_code}): {r.text[:200]}")
+    except ImportError:
+        print("  [텔레그램] requests 가 없음 — pip install requests 후 사용 가능")
+    except Exception as e:
+        print(f"  [텔레그램] 전송 실패: {e}")
+
+
+def tg_send(caption, force=False):
+    """오류/이벤트 알림 — 봇 동작을 안 막게 별도 스레드로 전송.
+
+    같은 오류가 반복돼도 TG_EVENT_COOLDOWN 안에는 한 번만 보냄.
+    force=True 는 쿨다운 무시 (비상정지·프로그램 종료처럼 꼭 알아야 하는 것).
+    """
+    global _tg_last_event
+    if not tg_enabled():
+        return
+    now = time.time()
+    if not force and now - _tg_last_event < TG_EVENT_COOLDOWN:
+        return
+    _tg_last_event = now
+    threading.Thread(target=_tg_send_now, args=(caption,), daemon=True).start()
+
+
+def tg_heartbeat():
+    """TELEGRAM_EVERY_MIN 간격으로 정기 스크린샷 전송 (봇이 돌고 있을 때만)."""
+    last = time.time()      # 시작하자마자 보내지 않고 첫 간격부터
+    while alive:
+        time.sleep(5)
+        if not (tg_enabled() and TELEGRAM_EVERY_MIN > 0 and running):
+            continue
+        if time.time() - last >= TELEGRAM_EVERY_MIN * 60:
+            last = time.time()
+            _tg_send_now(time.strftime("[정기보고 %H:%M] 봇 동작 중"))
 
 
 # ---------------------------------------------------------------- 단계별 동작
@@ -931,8 +1008,10 @@ def stop_with_retry(reason):
     if RETRY_SEC is not None:
         retry_at = time.time() + RETRY_SEC
         print(f"[정지] {reason} — {RETRY_SEC}초 뒤 자동 재시작 (즉시 재개 F8, 종료 F9)")
+        tg_send(f"[정지] {reason} — {RETRY_SEC}초 뒤 자동 재시작")
     else:
         print(f"[정지] {reason}")
+        tg_send(f"[정지] {reason} — 자동 재시작 없음 (수동 확인 필요)", force=True)
 
 
 def checkup(sct):
@@ -1050,6 +1129,10 @@ def worker():
         else:
             print("창 열림 확인: 픽셀 색 방식만 사용 — 'pip install pygetwindow' 를 "
                   "설치하면 창 제목으로 훨씬 정확하게 확인함")
+        if tg_enabled():
+            print(f"텔레그램 알림 ON — {TELEGRAM_EVERY_MIN}분마다 정기보고 + 오류 시 전송")
+        else:
+            print("텔레그램 알림 OFF — TELEGRAM_TOKEN / TELEGRAM_CHAT_ID 를 채우면 켜짐")
 
         with mss.mss() as sct:
             while alive:
@@ -1082,11 +1165,14 @@ def worker():
         print("       컴퓨터와 달라서, 추적 안 되는 좌표(JOB_BTN 등)가 화면")
         print("       밖으로 나갔을 때 발생해요. measure.py로 이 컴퓨터에서")
         print("       해당 좌표를 다시 재서 코드 상단 값을 바꿔주세요.")
+        tg_send("[비상정지] 마우스 안전정지 — 봇이 완전히 멈췄음 (수동 확인 필요)",
+                force=True)
         alive = False
     except Exception:
         import traceback
         print("\n\n[에러 발생] 아래 내용을 복사해서 알려주세요:\n")
         traceback.print_exc()
+        tg_send("[에러] 프로그램이 예외로 완전히 멈췄음 (수동 확인 필요)", force=True)
         alive = False
 
 
@@ -1116,6 +1202,7 @@ def main():
     keyboard.add_hotkey("f9", quit_all)
     t = threading.Thread(target=worker, daemon=True)
     t.start()
+    threading.Thread(target=tg_heartbeat, daemon=True).start()
     while alive:
         time.sleep(0.2)
     print("끝.")
