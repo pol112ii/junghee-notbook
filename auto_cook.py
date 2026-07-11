@@ -125,6 +125,12 @@ COOK_TIMEOUT = 90       # 요리 1판 최대 대기(초)
 
 # ----- 검증 / 스캔 주기 / 자동 재시작 -----
 MIN_SLOT_PX = 40        # 요리창 슬롯 안 밝은 픽셀이 이보다 적으면 '빈 슬롯'으로 봄
+# 창 열림 판정 기준 — 예전(비율 0.5, 오차 30)엔 게임 배경(풀밭 등 초록)도
+# 통과해서 창이 안 열렸는데 열린 걸로 착각하는 사고가 남. UI 배경은 민무늬
+# 단색이니 "거의 전부 일치 + 색 편차 거의 없음"까지 요구해서 오인 차단.
+WINDOW_BG_TOL  = 28     # 초록 배경과의 채널별 허용 오차
+WINDOW_BG_FRAC = 0.85   # 배경색과 일치해야 하는 픽셀 비율
+WINDOW_BG_STD  = 18     # 확인 띠 안의 색 편차 허용치 (게임 배경은 얼룩덜룩해서 큼)
 SCAN_EVERY = (3, 5)     # 인벤토리 스캔 주기 — 이 범위에서 랜덤한 판 수마다 한 번만 스캔
                         # (그 사이엔 지난 스캔의 칸 위치를 재사용. 실패하면 그때 재스캔)
 AUTO_RESTART_SEC = 60   # 오류로 멈췄을 때 이 시간 뒤 자동 재시작 (F8을 다시 누른 효과)
@@ -525,8 +531,11 @@ def window_open(sct):
     region = {"top": max(GAUGE_TOP - 22, 0), "left": GAUGE_LEFT,
               "width": GAUGE_WIDTH, "height": 14}
     img = np.asarray(sct.grab(region), dtype=int)[:, :, :3][:, :, ::-1]
-    near_bg = np.all(np.abs(img - _bg) <= 30, axis=-1)
-    return near_bg.mean() > 0.5
+    near_bg = np.all(np.abs(img - _bg) <= WINDOW_BG_TOL, axis=-1)
+    if near_bg.mean() < WINDOW_BG_FRAC:
+        return False
+    # 색이 비슷해도 얼룩덜룩하면(=게임 배경) 창 아님 — UI 배경은 민무늬 단색
+    return img.reshape(-1, 3).std(axis=0).max() <= WINDOW_BG_STD
 
 
 def slot_filled(sct, slot_index):
@@ -604,6 +613,15 @@ def fill_slots(sct, templates, scan_state):
             print(f"스캔 생략 — 지난 스캔 재사용 (남은 {scan_state['rounds_left']}판)")
 
         found = scan_state["found"]
+
+        # 새 판인데 드래그도 하기 전에 슬롯이 '전부' 차 있는 것으로 보이면,
+        # 실제로는 음식만들기 창이 안 열려 있고 게임 배경을 슬롯으로 착각한 것.
+        # (진짜 열린 창의 새 판 슬롯은 검은 빈 칸이라 이렇게 나올 수 없음)
+        if attempt == 0 and all(slot_filled(sct, i) for i in range(len(plan))):
+            print("[중단] 드래그 전인데 슬롯 5칸이 전부 차 있는 것으로 보임 — "
+                  "음식만들기 창이 실제로는 안 열린 상태로 판단 (배경 오인)")
+            return False
+
         used = {}
         shortage = None
         for slot, name in enumerate(plan):
@@ -712,6 +730,12 @@ def cook_one_round(sct):
         pos = read_pos(sct)
 
         if pos is None:
+            # 수은이 안 보이는데 창 자체도 안 보이고, 아직 수은을 한 번도
+            # 못 봤다면 = 시작이 제대로 안 된 것 → 버튼을 헛누르지 말고 중단.
+            # (seen 이후의 창 닫힘은 위의 '요리 끝' 검사가 처리함)
+            if not seen and not window_open(sct):
+                print("\n[중단] 시작을 눌렀는데 음식만들기 창/수은이 안 보임")
+                return False
             # 창은 열려있는데 수은이 눈금 밖 = 너무 차갑거나 뜨거움 → 되돌리기
             want = "+" if last_pos >= ZONE_CENTER else "-"
             if want != last_dir or now - last_press > REPRESS_SEC:
