@@ -24,6 +24,8 @@ import re
 import time
 import random
 import threading
+import urllib.parse
+import urllib.request
 
 import mss
 import numpy as np
@@ -128,6 +130,7 @@ MIN_SLOT_PX = 40        # 요리창 슬롯 안 밝은 픽셀이 이보다 적으
 # 창 열림 확인 — 1순위: OS 창 목록에 '음식만들기' 제목의 창이 실제로 있는지
 # (pygetwindow 필요, 제일 확실함). 없으면 2순위: 온도계 위 초록 배경 픽셀.
 COOK_WIN_TITLE = "음식만들기"
+JOB_WIN_TITLE  = "직업"      # 직업 창 제목 (부분일치로 열림 확인) — 게임 창 제목이 다르면 수정
 # 픽셀 방식 기준 — 0.5/30은 게임 배경(초록)도 통과했고(열림 오판),
 # 0.85/18은 진짜 열린 창도 탈락시킴(닫힘 오판) → 중간값으로. 그래도 틀리면
 # 실패 시 출력되는 [진단] 측정값을 보고 GAUGE_BG_RGB와 이 값들을 맞출 것.
@@ -138,17 +141,14 @@ SCAN_EVERY = (3, 5)     # 인벤토리 스캔 주기 — 이 범위에서 랜덤
                         # (그 사이엔 지난 스캔의 칸 위치를 재사용. 실패하면 그때 재스캔)
 AUTO_RESTART_SEC = 60   # 오류로 멈췄을 때 이 시간 뒤 자동 재시작 (F8을 다시 누른 효과)
 
-# ----- 텔레그램 알림 (전체 화면 스크린샷 전송) -----
-# 사용법: 텔레그램에서 @BotFather 에게 /newbot 으로 봇을 만들어 토큰을 받고,
-# 만든 봇에게 아무 메시지나 하나 보낸 뒤
-# https://api.telegram.org/bot<토큰>/getUpdates 를 브라우저로 열면
-# "chat":{"id":123456789 ...} 에서 내 chat_id를 확인할 수 있음.
-# 둘 다 채우면 켜지고, 비워두면 텔레그램 기능 전체가 꺼짐. (requests 필요:
-# 없다고 나오면 pip install requests)
-TELEGRAM_TOKEN   = ""        # 예: "123456789:AAH9x..."
-TELEGRAM_CHAT_ID = ""        # 예: "123456789"
-TELEGRAM_EVERY_MIN = 30      # 이 간격(분)마다 정기 스크린샷 전송. 0이면 정기 전송만 끔
-TG_EVENT_COOLDOWN = 300      # 같은 오류가 반복될 때 오류 알림 최소 간격(초) — 알림 폭탄 방지
+# ----- 텔레그램 알림 -----
+# 오류나 재료 부족으로 멈추면 텔레그램으로 알려줌. 규남노트북과 같은 봇/대화방을
+# 쓰고, 앞에 붙는 NOTIFY_NAME으로 어느 노트북인지 구분함.
+TELEGRAM_TOKEN   = "8659289448:AAFPFnCGHtenO-3pAIHg4ifnmV1sqxDCH-4"
+TELEGRAM_CHAT_ID = "7876105552"
+NOTIFY_NAME      = "정희노트북"   # 알림 앞에 붙는 이름
+NOTIFY_COOLDOWN  = 600    # 같은 내용의 알림을 다시 보내기까지 최소 간격(초) — 도배 방지
+REPORT_EVERY_MIN = 30     # 이 간격(분)마다 누적 완료 판수를 현황 보고로 보냄. 0이면 끔
 
 # (컴퓨터별 프로필/자동 추적 기능은 제거함 — 위 좌표를 이 컴퓨터에 고정으로 사용.
 #  게임 창을 옮기지 말고 그대로 둘 것. 다른 컴퓨터에서 쓰려면 위 좌표들을
@@ -171,6 +171,13 @@ pyautogui.FAILSAFE = True
 
 running = False
 alive = True
+
+# ----- 텔레그램/현황 보고용 상태 -----
+_last_notify = {}                # 알림 종류별 마지막 전송 시각 (같은 내용 도배 방지)
+_rounds_done = 0                 # 프로그램 시작 후 완료한 판 수 (누적)
+_session_t0 = time.time()        # 프로그램 시작 시각
+_last_report = time.time()       # 마지막 현황 보고 시각
+_rounds_at_report = 0            # 마지막 보고 시점의 누적 판수 (최근 증가분 계산용)
 
 # 측정된 원본 좌표 보관 (창 이동 보정의 기준값). recalibrate가 여기에 delta를 더함.
 _BASE_COORD = {
@@ -530,71 +537,6 @@ def scan_inventory(sct, templates):
     return found, min_diffs
 
 
-# ---------------------------------------------------------------- 텔레그램 알림
-
-_tg_last_event = 0.0     # 마지막 오류 알림 시각 (반복 알림 폭탄 방지용)
-
-
-def tg_enabled():
-    return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
-
-
-def _tg_send_now(caption):
-    """전체 화면(모든 모니터 합침)을 캡처해 텔레그램으로 전송. 이 함수는 느릴 수
-    있으니(전송 1~2초) 반드시 별도 스레드에서 호출할 것 (tg_send가 해줌)."""
-    try:
-        import io
-        import requests
-        with mss.mss() as s:                       # 스레드마다 mss 인스턴스 따로
-            shot = s.grab(s.monitors[0])           # [0] = 모든 모니터 합친 전체 화면
-            img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=70)   # PNG보다 훨씬 작게 (수백 KB)
-        buf.seek(0)
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000]},
-            files={"photo": ("screen.jpg", buf, "image/jpeg")},
-            timeout=20,
-        )
-        if r.status_code == 200:
-            print(f"  [텔레그램] 전송됨: {caption}")
-        else:
-            print(f"  [텔레그램] 전송 실패 (응답 {r.status_code}): {r.text[:200]}")
-    except ImportError:
-        print("  [텔레그램] requests 가 없음 — pip install requests 후 사용 가능")
-    except Exception as e:
-        print(f"  [텔레그램] 전송 실패: {e}")
-
-
-def tg_send(caption, force=False):
-    """오류/이벤트 알림 — 봇 동작을 안 막게 별도 스레드로 전송.
-
-    같은 오류가 1분마다 반복돼도 TG_EVENT_COOLDOWN 안에는 한 번만 보냄.
-    force=True 는 쿨다운 무시 (비상정지·프로그램 종료처럼 꼭 알아야 하는 것).
-    """
-    global _tg_last_event
-    if not tg_enabled():
-        return
-    now = time.time()
-    if not force and now - _tg_last_event < TG_EVENT_COOLDOWN:
-        return
-    _tg_last_event = now
-    threading.Thread(target=_tg_send_now, args=(caption,), daemon=True).start()
-
-
-def tg_heartbeat():
-    """TELEGRAM_EVERY_MIN 간격으로 정기 스크린샷 전송 (봇이 돌고 있을 때만)."""
-    last = time.time()      # 시작하자마자 보내지 않고 첫 간격부터
-    while alive:
-        time.sleep(5)
-        if not (tg_enabled() and TELEGRAM_EVERY_MIN > 0 and running):
-            continue
-        if time.time() - last >= TELEGRAM_EVERY_MIN * 60:
-            last = time.time()
-            _tg_send_now(time.strftime("[정기보고 %H:%M] 봇 동작 중"))
-
-
 # ---------------------------------------------------------------- 단계별 동작
 
 _bg = np.array(GAUGE_BG_RGB, dtype=int)
@@ -667,25 +609,88 @@ def slot_filled(sct, slot_index):
     return int((img.sum(axis=2) > 90).sum()) >= MIN_SLOT_PX
 
 
+def win_visible(title):
+    """title이 제목에 포함된 게임 창이 화면에 보이는지. True/False, 확인 불가면 None."""
+    if _gw is None:
+        return None
+    try:
+        for w in _gw.getAllWindows():
+            if title in w.title and w.width > 0 and w.visible:
+                return True
+        return False
+    except Exception:
+        return None
+
+
+def open_job_window():
+    """직업 창이 '확실히' 열릴 때까지 처리. 열렸으면(또는 진행 가능하면) True.
+
+    직업 창이 안 열린 채 직업활동을 눌러봤자 허공 클릭이라, 클릭 → 창 확인 →
+    안 열렸으면 다시 클릭(최대 3번). 이미 열려있으면 다시 안 누름(토글로 닫힘 방지).
+    창 제목을 못 읽는 환경이면 예전처럼 클릭만 하고 넘어감(기존 동작 유지).
+    """
+    if JOB_BTN is None:
+        return True   # 직업 창이 요리 중에도 떠있다는 뜻 → 그냥 진행
+    vis = win_visible(JOB_WIN_TITLE)
+    if vis is True:
+        print("직업 창 이미 열려있음")
+        return True
+    if vis is None:
+        # pygetwindow로 확인 불가 → 예전 방식대로 클릭하고 시간만 기다림
+        direct_click(JOB_BTN, "직업")
+        time.sleep(random.uniform(1.2, 2.0))
+        return True
+    for attempt in range(3):
+        direct_click(JOB_BTN, "직업")
+        t0 = time.time()
+        while running and alive and time.time() - t0 < 4:
+            if win_visible(JOB_WIN_TITLE) is True:
+                print("직업 창 열림 확인")
+                time.sleep(random.uniform(0.6, 1.0))
+                return True
+            time.sleep(0.2)
+        if not (running and alive):
+            return False
+        print(f"  직업 창이 안 열림 → 다시 클릭 ({attempt + 2}번째 시도)")
+    # 3번 눌러도 '직업' 제목이 안 잡힘 — 게임이 이 창을 다른 제목으로 띄우는 것일 수
+    # 있으니, 최소한 예전 동작은 유지하도록 직업활동까지는 진행해봄
+    print(f"  직업 창 제목('{JOB_WIN_TITLE}')을 못 잡음 → 예전 방식대로 직업활동까지 진행")
+    return True
+
+
 def reopen_window(sct):
     """직업 → 직업활동 클릭으로 음식만들기 창을 다시 염. 성공하면 True.
 
-    곡선 이동 없이 직선으로 곧장 이동해서 클릭 (direct_click) — 확실하게.
+    게임 구조: 직업 창을 연 뒤 '직업활동'을 누르면 음식만들기 창이 생기고
+    직업 창은 사라짐. 그래서 순서마다 실제로 됐는지 확인하고 안 됐으면 재시도:
+      1) 직업 창이 열린 것을 확인 (open_job_window)
+      2) 직업활동 클릭 → 음식만들기 창이 뜨는지 확인, 안 뜨면 다시 클릭 (최대 3번)
+    (모든 클릭은 곡선 없이 직선으로 곧장 이동 — direct_click)
     """
     if JOB_ACT_BTN is None:
         print("[설정 필요] JOB_ACT_BTN(직업활동 버튼 좌표)이 없어서 반복 불가")
         return False
-    if JOB_BTN is not None:
-        direct_click(JOB_BTN, "직업")
-        time.sleep(random.uniform(1.2, 2.0))
-    direct_click(JOB_ACT_BTN, "직업활동")
-    t0 = time.time()
-    while running and alive and time.time() - t0 < REOPEN_WAIT:
-        if window_open(sct):
-            print("음식만들기 창 열림 확인")
-            time.sleep(random.uniform(1.0, 1.8))
-            return True
-        time.sleep(0.2)
+    if not open_job_window():
+        return False
+    for attempt in range(3):
+        direct_click(JOB_ACT_BTN, "직업활동")
+        t0 = time.time()
+        while running and alive and time.time() - t0 < REOPEN_WAIT:
+            if window_open(sct):
+                print("음식만들기 창 열림 확인")
+                time.sleep(random.uniform(1.0, 1.8))
+                return True
+            time.sleep(0.2)
+        if not (running and alive):
+            return False
+        # 음식만들기가 안 떴음 — 직업 창이 사라졌으면 클릭은 먹었는데 뭔가 꼬인 것,
+        # 남아있으면 클릭이 빗나간 것. 어느 쪽이든 직업 창부터 다시 확보하고 재시도.
+        if win_visible(JOB_WIN_TITLE) is False:
+            print("  직업활동은 눌렸는데 음식만들기 창이 안 뜸 → 직업 창부터 다시 열기")
+            if not open_job_window():
+                return False
+        else:
+            print("  직업활동 클릭이 안 먹은 듯 (직업 창 그대로) → 다시 클릭")
     print("[실패] 음식만들기 창이 안 열림 — 좌표/창 위치 확인")
     mean, frac, std = band_stats(sct)
     print(f"       [진단] 창 제목 감지: {_cook_win_exists()} / 온도계 위 확인 띠: "
@@ -899,10 +904,113 @@ def cook_one_round(sct):
     return False
 
 
+# ---------------------------------------------------------------- 텔레그램 알림
+
+def _send_telegram(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
+    urllib.request.urlopen(url, data=data, timeout=10)
+
+
+def _screenshot_jpeg():
+    """전체 화면(모든 모니터 합침)을 JPEG 바이트로 캡처.
+
+    mss는 만든 스레드에서만 안전해서, 알림 보내는 스레드에서 매번 새로 만들어 씀.
+    JPEG 품질 70이면 PNG보다 훨씬 작아서(수백 KB) 전송이 빠름.
+    """
+    import io
+    with mss.mss() as s:
+        shot = s.grab(s.monitors[0])   # [0] = 모든 모니터를 합친 전체 화면
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=70)
+    return buf.getvalue()
+
+
+def _send_telegram_photo(caption):
+    """스크린샷을 찍어 사진+캡션으로 전송 (sendPhoto).
+
+    requests 없이 표준 urllib만으로 multipart/form-data를 직접 만들어 보냄
+    → 추가 설치 없이 이 파일 하나로 동작.
+    """
+    jpg = _screenshot_jpeg()
+    boundary = "----tg%030x" % random.randrange(16 ** 30)
+    parts = []
+    for name, value in (("chat_id", TELEGRAM_CHAT_ID),
+                        ("caption", caption[:1000])):   # 텔레그램 캡션 한도 1024자
+        parts.append((f"--{boundary}\r\n"
+                      f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                      f"{value}\r\n").encode("utf-8"))
+    parts.append((f"--{boundary}\r\n"
+                  'Content-Disposition: form-data; name="photo"; '
+                  'filename="screen.jpg"\r\n'
+                  "Content-Type: image/jpeg\r\n\r\n").encode("utf-8"))
+    parts.append(jpg)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+        data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    urllib.request.urlopen(req, timeout=20)
+
+
+def notify(text, key=None, wait=False):
+    """봇 상태를 텔레그램으로 알림 — 전체 화면 스크린샷을 같이 보냄.
+
+    - key가 같은 알림은 NOTIFY_COOLDOWN 안엔 다시 안 보냄 (같은 오류 도배 방지)
+    - 기본은 백그라운드 스레드로 전송 → 인터넷이 느려도 봇 동작에 영향 없음
+    - wait=True는 프로그램이 곧 종료되는 경우용 (전송이 끝날 때까지 기다림)
+    - 스크린샷 전송이 실패하면(캡처 오류 등) 예전처럼 글자만이라도 보냄
+    """
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    now = time.time()
+    k = key or text
+    if now - _last_notify.get(k, 0) < NOTIFY_COOLDOWN:
+        return
+    _last_notify[k] = now
+
+    def _send():
+        full = f"[{NOTIFY_NAME}] {text}"
+        try:
+            _send_telegram_photo(full)
+            print("  (텔레그램 알림+스크린샷 보냄)")
+        except Exception as e:
+            print(f"  (스크린샷 전송 실패: {e} → 글자만 보냄)")
+            try:
+                _send_telegram(full)
+                print("  (텔레그램 알림 보냄)")
+            except Exception as e2:
+                print(f"  (텔레그램 알림 실패: {e2})")
+
+    if wait:
+        _send()
+    else:
+        threading.Thread(target=_send, daemon=True).start()
+
+
+def maybe_report():
+    """REPORT_EVERY_MIN 간격으로 누적 완료 판수를 현황 보고. 정지 중엔 안 보냄."""
+    global _last_report, _rounds_at_report
+    if not REPORT_EVERY_MIN:
+        return
+    now = time.time()
+    if now - _last_report < REPORT_EVERY_MIN * 60:
+        return
+    _last_report = now
+    if not running:
+        return   # 사용자가 직접 꺼둔 상태 — 보고 생략 (타이머만 갱신)
+    recent = _rounds_done - _rounds_at_report
+    _rounds_at_report = _rounds_done
+    up = int((now - _session_t0) / 60)
+    notify(f"📊 현황: 가동 {up // 60}시간 {up % 60}분 · 누적 {_rounds_done}판 완료 "
+           f"(최근 {REPORT_EVERY_MIN}분간 {recent}판) · 상태: 실행 중", key="status")
+
+
 # ---------------------------------------------------------------- 메인 루프
 
 def worker():
-    global running, alive
+    global running, alive, _rounds_done
     # 스캔 캐시 — found: 지난 스캔 결과, rounds_left: 재사용 가능한 남은 판 수
     scan_state = {"found": None, "min_diffs": None, "rounds_left": 0}
 
@@ -917,7 +1025,9 @@ def worker():
         scan_state["found"] = None
         print(f"\n[오류] '{stage}' 단계에서 실패 — {AUTO_RESTART_SEC}초 뒤 자동 재시작")
         print("       (기다리지 않고 멈추려면 F8, 완전 종료는 F9)")
-        tg_send(f"[오류] '{stage}' 단계에서 실패 — {AUTO_RESTART_SEC}초 뒤 자동 재시작")
+        notify(f"⚠ 멈춤: '{stage}' 단계 실패\n"
+               f"({AUTO_RESTART_SEC}초 뒤 자동 재시작을 시도합니다)\n"
+               f"(지금까지 누적 {_rounds_done}판 완료)", key=stage)
         t0 = time.time()
         while running and alive and time.time() - t0 < AUTO_RESTART_SEC:
             time.sleep(0.2)
@@ -940,13 +1050,10 @@ def worker():
         else:
             print("창 열림 확인: 픽셀 색 방식만 사용 — 'pip install pygetwindow' 를 "
                   "설치하면 창 제목으로 훨씬 정확하게 확인함")
-        if tg_enabled():
-            print(f"텔레그램 알림 ON — {TELEGRAM_EVERY_MIN}분마다 정기보고 + 오류 시 전송")
-        else:
-            print("텔레그램 알림 OFF — TELEGRAM_TOKEN / TELEGRAM_CHAT_ID 를 채우면 켜짐")
 
         with mss.mss() as sct:
             while alive:
+                maybe_report()   # 주기 현황 보고 (때가 됐을 때만 전송)
                 if not running:
                     time.sleep(0.1)
                     continue
@@ -989,7 +1096,8 @@ def worker():
                     wait_restart(stage)
                     continue
 
-                print("★ 한 판 완료!")
+                _rounds_done += 1
+                print(f"★ 한 판 완료! (누적 {_rounds_done}판)")
                 if not LOOP:
                     running = False
                     print("정지 (LOOP=False). 다시 하려면 F8.")
@@ -1003,14 +1111,15 @@ def worker():
         print("       컴퓨터와 달라서, 추적 안 되는 좌표(JOB_BTN 등)가 화면")
         print("       밖으로 나갔을 때 발생해요. measure.py로 이 컴퓨터에서")
         print("       해당 좌표를 다시 재서 코드 상단 값을 바꿔주세요.")
-        tg_send("[비상정지] 마우스 안전정지 — 봇이 완전히 멈췄음 (수동 확인 필요)",
-                force=True)
+        notify(f"🛑 비상정지(마우스가 화면 구석) — 봇이 완전히 종료됨. 직접 다시 실행해야 함."
+               f"\n(지금까지 누적 {_rounds_done}판 완료)", wait=True)
         alive = False
     except Exception:
         import traceback
         print("\n\n[에러 발생] 아래 내용을 복사해서 알려주세요:\n")
         traceback.print_exc()
-        tg_send("[에러] 프로그램이 예외로 완전히 멈췄음 (수동 확인 필요)", force=True)
+        notify(f"🛑 치명적 에러로 봇이 완전히 종료됨. 컴퓨터에서 콘솔 확인 필요."
+               f"\n(지금까지 누적 {_rounds_done}판 완료)", wait=True)
         alive = False
 
 
@@ -1037,7 +1146,6 @@ def main():
     keyboard.add_hotkey("f9", quit_all)
     t = threading.Thread(target=worker, daemon=True)
     t.start()
-    threading.Thread(target=tg_heartbeat, daemon=True).start()
     while alive:
         time.sleep(0.2)
     print("끝.")
