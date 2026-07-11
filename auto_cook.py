@@ -87,9 +87,13 @@ CELL_SIZE = 32          # capture_items.py와 같은 값 (배율 커서 실제 �
 SEARCH_MARGIN = 4       # 계산된 칸 위치가 어긋나도 실제 아이콘 중심을 스스로 찾는 여유 범위
                         # (칸 간격 41px보다 너무 넓으면 옆 칸까지 침범해서 오작동하니 좁게)
 
-SLOT1_CENTER = (1563, 105)  # 요리창 재료 슬롯 1번(맨 왼쪽 검은 칸) 중심
-SLOT_PITCH_X = 65       # 슬롯 간 가로 간격
+SLOT1_CENTER = (1565, 105)  # 요리창 재료 슬롯 1번(맨 왼쪽 검은 칸) 중심 — 스크린샷 실측 보정
+SLOT_PITCH_X = 66.4     # 슬롯 간 가로 간격 — 스크린샷 실측 (65로 쓰면 오차가 쌓여
+                        #   5번 슬롯이 ~8px 어긋나고, 검사 상자에 슬롯 옆 초록 배경이
+                        #   들어와 빈 칸을 '이미 참'으로 오판 → 재료 4개로 시작하는 사고)
 NUM_SLOTS = 5           # 지금 열려있는 슬롯 수 (5개 열리면 5로)
+SLOT_CHECK = 16         # 슬롯 채움 검사 상자 크기(px) — 슬롯(32px)의 중앙만 봐서
+                        #   좌표가 몇 px 어긋나도 슬롯 사이 배경이 안 섞이게 함
 
 # ===================== 레시피 =====================
 # (재료이름, 넣을 개수) — 이름은 items 폴더의 파일명과 똑같이.
@@ -126,7 +130,8 @@ MIN_ITEM_PX = 40        # 칸 중앙에 밝은 픽셀이 이보다 적으면 빈
 COOK_TIMEOUT = 90       # 요리 1판 최대 대기(초)
 
 # ----- 검증 / 스캔 주기 / 자동 재시작 -----
-MIN_SLOT_PX = 40        # 요리창 슬롯 안 밝은 픽셀이 이보다 적으면 '빈 슬롯'으로 봄
+MIN_SLOT_PX = 12        # 요리창 슬롯 안 밝은 픽셀이 이보다 적으면 '빈 슬롯'으로 봄
+                        # (검사 상자가 32→16px로 줄어서 40→12로 비례 조정)
 # 창 열림 확인 — 1순위: OS 창 목록에 '음식만들기' 제목의 창이 실제로 있는지
 # (pygetwindow 필요, 제일 확실함). 없으면 2순위: 온도계 위 초록 배경 픽셀.
 COOK_WIN_TITLE = "음식만들기"
@@ -614,12 +619,17 @@ def window_open(sct):
 
 
 def slot_px(sct, slot_index):
-    """요리창 재료 슬롯(0부터 셈) 안의 밝은 픽셀 수 (채움 판정의 원재료)."""
+    """요리창 재료 슬롯(0부터 셈) 안의 밝은 픽셀 수 (채움 판정의 원재료).
+
+    슬롯 전체(32px)가 아니라 중앙 SLOT_CHECK(16px)만 봄 — 좌표가 몇 px
+    어긋나도 슬롯 사이 초록 배경(밝음)이 검사에 안 섞여, 빈 칸을
+    '이미 참'으로 오판하지 않음.
+    """
     cx = int(SLOT1_CENTER[0] + slot_index * SLOT_PITCH_X)
     cy = int(SLOT1_CENTER[1])
-    half = CELL_SIZE // 2
+    half = SLOT_CHECK // 2
     shot = sct.grab({"left": cx - half, "top": cy - half,
-                     "width": CELL_SIZE, "height": CELL_SIZE})
+                     "width": SLOT_CHECK, "height": SLOT_CHECK})
     img = np.asarray(shot, dtype=int)[:, :, :3]
     return int((img.sum(axis=2) > 90).sum())
 
@@ -1199,7 +1209,7 @@ def quit_all():
 def main():
     print("=" * 48)
     print(" 음식만들기 풀 자동 봇 (재료넣기 + 시작 + 온도조절)")
-    print(" 버전: v3 (스크린샷 알림 + 툴팁 오판 수정 + 슬롯 진단)")
+    print(" 버전: v4 (슬롯 간격 실측 보정 66.4px + 중앙만 검사)")
     print(" F8 = 시작/정지    F9 = 종료")
     print(" 비상시: 마우스를 화면 왼쪽 위 구석으로!")
     print("=" * 48)
