@@ -125,12 +125,15 @@ COOK_TIMEOUT = 90       # 요리 1판 최대 대기(초)
 
 # ----- 검증 / 스캔 주기 / 자동 재시작 -----
 MIN_SLOT_PX = 40        # 요리창 슬롯 안 밝은 픽셀이 이보다 적으면 '빈 슬롯'으로 봄
-# 창 열림 판정 기준 — 예전(비율 0.5, 오차 30)엔 게임 배경(풀밭 등 초록)도
-# 통과해서 창이 안 열렸는데 열린 걸로 착각하는 사고가 남. UI 배경은 민무늬
-# 단색이니 "거의 전부 일치 + 색 편차 거의 없음"까지 요구해서 오인 차단.
-WINDOW_BG_TOL  = 28     # 초록 배경과의 채널별 허용 오차
-WINDOW_BG_FRAC = 0.85   # 배경색과 일치해야 하는 픽셀 비율
-WINDOW_BG_STD  = 18     # 확인 띠 안의 색 편차 허용치 (게임 배경은 얼룩덜룩해서 큼)
+# 창 열림 확인 — 1순위: OS 창 목록에 '음식만들기' 제목의 창이 실제로 있는지
+# (pygetwindow 필요, 제일 확실함). 없으면 2순위: 온도계 위 초록 배경 픽셀.
+COOK_WIN_TITLE = "음식만들기"
+# 픽셀 방식 기준 — 0.5/30은 게임 배경(초록)도 통과했고(열림 오판),
+# 0.85/18은 진짜 열린 창도 탈락시킴(닫힘 오판) → 중간값으로. 그래도 틀리면
+# 실패 시 출력되는 [진단] 측정값을 보고 GAUGE_BG_RGB와 이 값들을 맞출 것.
+WINDOW_BG_TOL  = 30     # 초록 배경과의 채널별 허용 오차
+WINDOW_BG_FRAC = 0.75   # 배경색과 일치해야 하는 픽셀 비율
+WINDOW_BG_STD  = 22     # 확인 띠 안의 색 편차 허용치 (게임 배경은 얼룩덜룩해서 큼)
 SCAN_EVERY = (3, 5)     # 인벤토리 스캔 주기 — 이 범위에서 랜덤한 판 수마다 한 번만 스캔
                         # (그 사이엔 지난 스캔의 칸 위치를 재사용. 실패하면 그때 재스캔)
 AUTO_RESTART_SEC = 60   # 오류로 멈췄을 때 이 시간 뒤 자동 재시작 (F8을 다시 누른 효과)
@@ -520,21 +523,55 @@ def scan_inventory(sct, templates):
 _bg = np.array(GAUGE_BG_RGB, dtype=int)
 
 
-def window_open(sct):
-    """음식만들기 창이 열려있는지 — 온도계 관 '바로 위'의 배경이 보이는지로 판단.
+def _cook_win_exists():
+    """OS 창 목록에서 '음식만들기' 창이 실제로 떠 있는지 확인.
 
-    관 자체(GAUGE_TOP~+HEIGHT)를 보면 요리 중엔 수은(빨강/노랑)이 채우고 있어서
-    배경이 안 보이는 게 정상이라, 요리 중인데 "닫혔다"고 오판하게 됨.
-    그래서 수은이 절대 닿지 않는, 관 바로 위쪽 얇은 띠만 확인함 — 여긴 창이
-    열려있는 한 항상 배경색이어야 하고, 창이 실제로 닫힐 때만 사라짐.
+    창 제목으로 직접 확인하는 거라 픽셀 색 추측보다 훨씬 확실함.
+    pygetwindow가 없거나 조회에 실패하면 None(판단 불가) 반환.
     """
+    if _gw is None:
+        return None
+    try:
+        for w in _gw.getAllWindows():
+            if COOK_WIN_TITLE in w.title and w.width > 0 and w.visible:
+                return True
+        return False
+    except Exception:
+        return None
+
+
+def _grab_band(sct):
+    """온도계 관 '바로 위' 얇은 띠 캡처 (창 열림 픽셀 확인용)."""
     region = {"top": max(GAUGE_TOP - 22, 0), "left": GAUGE_LEFT,
               "width": GAUGE_WIDTH, "height": 14}
-    img = np.asarray(sct.grab(region), dtype=int)[:, :, :3][:, :, ::-1]
+    return np.asarray(sct.grab(region), dtype=int)[:, :, :3][:, :, ::-1]
+
+
+def band_stats(sct):
+    """확인 띠의 (평균색, 기준색 일치 비율, 최대 색 편차) — 진단 출력용."""
+    img = _grab_band(sct)
+    flat = img.reshape(-1, 3)
+    near = np.all(np.abs(img - _bg) <= WINDOW_BG_TOL, axis=-1)
+    return flat.mean(axis=0), near.mean(), flat.std(axis=0).max()
+
+
+def window_open(sct):
+    """음식만들기 창이 열려있는지.
+
+    1순위: OS 창 목록에 '음식만들기' 제목의 창이 있으면 열림 (제일 확실).
+    2순위: (창 제목을 못 쓰는 경우) 온도계 관 '바로 위'의 초록 배경 확인.
+      관 자체를 보면 요리 중엔 수은이 채우고 있어 오판하므로, 수은이 절대
+      닿지 않는 관 위쪽 얇은 띠만 봄. 색이 비슷해도 얼룩덜룩하면(=게임 배경)
+      창이 아닌 것으로 처리.
+    """
+    exists = _cook_win_exists()
+    if exists:
+        return True
+    # 제목을 못 찾았어도 (게임이 OS 창을 안 쓰는 환경 대비) 픽셀로 한 번 더 확인
+    img = _grab_band(sct)
     near_bg = np.all(np.abs(img - _bg) <= WINDOW_BG_TOL, axis=-1)
     if near_bg.mean() < WINDOW_BG_FRAC:
         return False
-    # 색이 비슷해도 얼룩덜룩하면(=게임 배경) 창 아님 — UI 배경은 민무늬 단색
     return img.reshape(-1, 3).std(axis=0).max() <= WINDOW_BG_STD
 
 
@@ -573,6 +610,12 @@ def reopen_window(sct):
             return True
         time.sleep(0.2)
     print("[실패] 음식만들기 창이 안 열림 — 좌표/창 위치 확인")
+    mean, frac, std = band_stats(sct)
+    print(f"       [진단] 창 제목 감지: {_cook_win_exists()} / 온도계 위 확인 띠: "
+          f"평균색 RGB({mean[0]:.0f},{mean[1]:.0f},{mean[2]:.0f}) "
+          f"일치 {frac*100:.0f}% 편차 {std:.0f}")
+    print(f"       눈으로는 창이 열려 있는데 이 메시지가 나오면, GAUGE_BG_RGB(현재 "
+          f"{GAUGE_BG_RGB})를 위 평균색으로 바꿔보세요.")
     return False
 
 
@@ -814,6 +857,11 @@ def worker():
         else:
             print("창 자동 추적 OFF — 창을 측정한 자리에 고정해야 함 "
                   "(pygetwindow 설치 시 자동 ON)")
+        if _gw:
+            print(f"창 열림 확인: OS 창 제목('{COOK_WIN_TITLE}') 방식 (+ 픽셀 보조)")
+        else:
+            print("창 열림 확인: 픽셀 색 방식만 사용 — 'pip install pygetwindow' 를 "
+                  "설치하면 창 제목으로 훨씬 정확하게 확인함")
 
         with mss.mss() as sct:
             while alive:
