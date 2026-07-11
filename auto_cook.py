@@ -491,7 +491,13 @@ def clear_tooltip():
     커서가 방금 넣은 재료 위에 있으면 게임이 툴팁(설명창)을 커서 오른쪽에 띄우고,
     그게 바로 옆 슬롯을 밝게 덮음 → slot_filled가 '이미 찼다'고 오판해서 재료를
     덜 넣고 시작하는 사고가 남. 그래서 슬롯 상태를 볼 땐 항상 먼저 이걸 호출.
+
+    이미 빈 곳(슬롯 줄 아래 + 인벤토리 오른쪽)에 있으면 안 움직이고 바로 반환
+    → 확인이 연달아 있어도 시간 낭비 없음 (판당 추가 시간 1~2초 수준).
     """
+    cx, cy = pyautogui.position()
+    if cy >= SLOT1_CENTER[1] + 150 and cx >= SLOT1_CENTER[0] - 80:
+        return   # 이미 치워져 있음 — 툴팁 뜰 위치 아님
     px = int(SLOT1_CENTER[0] + random.randint(-15, 15))
     py = int(SLOT1_CENTER[1] + 190 + random.randint(-10, 10))   # 슬롯 줄 한참 아래 빈 곳
     smooth_move_to(px, py, random.uniform(0.12, 0.22), bow=5)
