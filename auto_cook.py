@@ -485,6 +485,19 @@ def park_mouse():
     time.sleep(random.uniform(0.1, 0.2))
 
 
+def clear_tooltip():
+    """슬롯 확인 전에 커서를 슬롯 줄에서 치워, 아이템 툴팁이 옆 슬롯을 못 가리게 함.
+
+    커서가 방금 넣은 재료 위에 있으면 게임이 툴팁(설명창)을 커서 오른쪽에 띄우고,
+    그게 바로 옆 슬롯을 밝게 덮음 → slot_filled가 '이미 찼다'고 오판해서 재료를
+    덜 넣고 시작하는 사고가 남. 그래서 슬롯 상태를 볼 땐 항상 먼저 이걸 호출.
+    """
+    px = int(SLOT1_CENTER[0] + random.randint(-15, 15))
+    py = int(SLOT1_CENTER[1] + 190 + random.randint(-10, 10))   # 슬롯 줄 한참 아래 빈 곳
+    smooth_move_to(px, py, random.uniform(0.12, 0.22), bow=5)
+    time.sleep(random.uniform(0.2, 0.35))   # 툴팁이 사라질 짬
+
+
 def save_debug_scan(sct, tag="debug_scan"):
     """인벤토리 영역 전체를 캡처해 파일로 저장 (인식 실패 원인 눈으로 확인용)."""
     from PIL import Image as _Image
@@ -762,6 +775,7 @@ def fill_slots(sct, templates, scan_state):
                 print(f"'{name}' → 슬롯 {slot+1} 드래그")
                 human_drag(src, dst=(SLOT1_CENTER[0] + slot * SLOT_PITCH_X,
                                      SLOT1_CENTER[1]))
+                clear_tooltip()     # 커서 위 툴팁이 슬롯을 가리기 전에 치우고 확인
                 if slot_filled(sct, slot):
                     placed = True
                 else:
@@ -772,7 +786,8 @@ def fill_slots(sct, templates, scan_state):
                 shortage = name
                 break
 
-        # 최종 확인: 시작 전에 슬롯이 전부 실제로 채워졌는지
+        # 최종 확인: 시작 전에 슬롯이 전부 실제로 채워졌는지 (툴팁 치우고 봄)
+        clear_tooltip()
         empty = [i + 1 for i in range(len(plan)) if not slot_filled(sct, i)]
         if not empty:
             scan_state["rounds_left"] -= 1
@@ -809,6 +824,7 @@ def cook_one_round(sct):
     if not window_open(sct):
         print("[중단] 시작 직전 확인 — 음식만들기 창이 안 보임 (시작 안 누름)")
         return False
+    clear_tooltip()     # 커서 위 툴팁이 슬롯을 가려 '찼다'고 오판하는 것 방지
     empty = [i + 1 for i in range(need) if not slot_filled(sct, i)]
     if empty:
         print(f"[중단] 시작 직전 확인 — 슬롯 {empty} 이 비어 있음 (시작 안 누름)")
