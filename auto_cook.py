@@ -613,19 +613,38 @@ def window_open(sct):
     return img.reshape(-1, 3).std(axis=0).max() <= WINDOW_BG_STD
 
 
-def slot_filled(sct, slot_index):
-    """요리창 재료 슬롯(0부터 셈)에 아이템이 실제로 들어있는지 확인.
-
-    빈 슬롯은 어두운 검은 칸이라 밝은 픽셀이 거의 없음. 작은 영역 캡처
-    한 장이면 끝나서(수 ms) 넣어도 체감 속도엔 영향 없음.
-    """
+def slot_px(sct, slot_index):
+    """요리창 재료 슬롯(0부터 셈) 안의 밝은 픽셀 수 (채움 판정의 원재료)."""
     cx = int(SLOT1_CENTER[0] + slot_index * SLOT_PITCH_X)
     cy = int(SLOT1_CENTER[1])
     half = CELL_SIZE // 2
     shot = sct.grab({"left": cx - half, "top": cy - half,
                      "width": CELL_SIZE, "height": CELL_SIZE})
     img = np.asarray(shot, dtype=int)[:, :, :3]
-    return int((img.sum(axis=2) > 90).sum()) >= MIN_SLOT_PX
+    return int((img.sum(axis=2) > 90).sum())
+
+
+def slot_filled(sct, slot_index):
+    """요리창 재료 슬롯(0부터 셈)에 아이템이 실제로 들어있는지 확인.
+
+    빈 슬롯은 어두운 검은 칸이라 밝은 픽셀이 거의 없음. 작은 영역 캡처
+    한 장이면 끝나서(수 ms) 넣어도 체감 속도엔 영향 없음.
+    """
+    return slot_px(sct, slot_index) >= MIN_SLOT_PX
+
+
+def save_debug_slots(sct, tag="debug_slots"):
+    """요리창 슬롯 줄 전체를 캡처해 파일로 저장 — '이미 참' 오판 원인 확인용."""
+    left = int(SLOT1_CENTER[0] - CELL_SIZE)
+    top = int(SLOT1_CENTER[1] - CELL_SIZE)
+    width = int((NUM_SLOTS - 1) * SLOT_PITCH_X + CELL_SIZE * 2)
+    height = CELL_SIZE * 2
+    shot = sct.grab({"left": left, "top": top, "width": width, "height": height})
+    img = np.asarray(shot, dtype="uint8")[:, :, :3][:, :, ::-1]
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{tag}.png")
+    Image.fromarray(img).save(path)
+    print(f"       [진단] 슬롯 줄 캡처 저장: {path}")
+    return path
 
 
 def win_visible(title):
@@ -768,8 +787,13 @@ def fill_slots(sct, templates, scan_state):
 
         used = {}
         shortage = None
+        pre_filled = []      # 드래그도 안 했는데 '이미 참'으로 나온 슬롯 (오판 의심)
         for slot, name in enumerate(plan):
+            clear_tooltip()                 # 툴팁이 슬롯을 가린 채 확인하는 것 방지
             if slot_filled(sct, slot):      # (재시도 때) 이미 들어간 슬롯은 건너뜀
+                pre_filled.append(slot + 1)
+                print(f"  슬롯 {slot+1} 이미 차 있음(밝은픽셀 {slot_px(sct, slot)}"
+                      f"/기준 {MIN_SLOT_PX}) → 드래그 생략")
                 continue
             placed = False
             while running and alive and not placed:
@@ -791,6 +815,20 @@ def fill_slots(sct, templates, scan_state):
             if not placed:
                 shortage = name
                 break
+
+        # 새 판(재시도 아님)인데 드래그 없이 '이미 참'인 슬롯이 있었다면 오판 의심.
+        # 새 판의 슬롯은 전부 빈 검은 칸이어야 정상 — 슬롯 좌표가 어긋났거나,
+        # 5번째 슬롯이 게임에서 잠겨 있거나(4칸만 열림), 다른 UI가 덮은 것.
+        if attempt == 0 and pre_filled:
+            print(f"[진단] 새 판인데 드래그 없이 슬롯 {pre_filled} 이 차 있는 것으로 "
+                  f"보임 — 좌표 어긋남/슬롯 잠김/UI 가림 의심")
+            try:
+                save_debug_slots(sct)
+            except Exception:
+                pass
+            notify(f"⚠ 오판 의심: 드래그 없이 슬롯 {pre_filled} 이 '이미 참'으로 보임\n"
+                   f"(스크린샷에서 요리창 슬롯 {pre_filled} 상태를 확인해주세요 — "
+                   f"실제로 비어 있으면 좌표/잠금 문제)", key="preslot")
 
         # 최종 확인: 시작 전에 슬롯이 전부 실제로 채워졌는지 (툴팁 치우고 봄)
         clear_tooltip()
@@ -1161,6 +1199,7 @@ def quit_all():
 def main():
     print("=" * 48)
     print(" 음식만들기 풀 자동 봇 (재료넣기 + 시작 + 온도조절)")
+    print(" 버전: v3 (스크린샷 알림 + 툴팁 오판 수정 + 슬롯 진단)")
     print(" F8 = 시작/정지    F9 = 종료")
     print(" 비상시: 마우스를 화면 왼쪽 위 구석으로!")
     print("=" * 48)
